@@ -145,16 +145,37 @@ def find_config_packet(bitfile):
             if bits_to_int(parse_word(bitfile)) == SYNC_WORD:
                 sync_word_found = True
 
-    in_config_data = False
+    in_config_data    = False
+    type_2_fdri_write = False
+    packet_2_length   = None
+    
     # Search for the start of the type 2 packet, which is where the configuration frames are
     while not in_config_data:
-        word = parse_word(bitfile)               
+        word = parse_word(bitfile)
         # If type 2 packet header found, leave loop
-        if word[-3:] == [0, 1, 0]:
+        if word[-3:] == [0, 1, 0] and type_2_fdri_write:
+            packet_2_length = sum([b<<i for i, b in enumerate(word[:27])])
             in_config_data = True
+        # Some other bitstream content
+        else:
+            # FDRI write not yet found
+            type_2_fdri_write = False
+            
+            # If type 1 packet header found, parse packet
+            if word[-3:] == [1, 0, 0]:
+                packet_1_length = sum([b<<i for i, b in enumerate(word[:11])])
+                packet_1_addr   = sum([b<<i for i, b in enumerate(word[13:27])])
+                packet_1_opcode = sum([b<<i for i, b in enumerate(word[27:29])])
+                packet_1_data   = []
+                for i in range(packet_1_length):
+                    packet_1_data.append(parse_word(bitfile))
+                    
+                # the typical FDRI write is a type-1 packet containing FDRI and length 0
+                # followed by a type-2 packet containing the configuration frames
+                type_2_fdri_write = packet_1_opcode == 2 and packet_1_addr == 2 and packet_1_length == 0
 
     # We have read the bitstream up until the main configuration packet, exit the function
-    return part_name    
+    return part_name, packet_2_length
     
 
 def get_frame_list(part:str):
@@ -252,7 +273,7 @@ def get_frame_list(part:str):
     return sorted(frames)
 
 
-def parse_config_packet(bitfile, frames:list):
+def parse_config_packet(bitfile, config_packet_length:int, frames:list):
     '''
         Parses the main configuration packet for all high bits
             Arguments: The opened bitstream file and the list of frame addresses
@@ -261,6 +282,15 @@ def parse_config_packet(bitfile, frames:list):
 
     # The number of words in a frame
     FRAME_LENGTH = 101
+    
+    
+    # check if config packet is multiple of frame length
+    if config_packet_length % FRAME_LENGTH != 0:
+        print("ERROR: Config packet length must be multiple of frame length")
+        exit()
+        
+    # frames remaining to be parsed
+    frames_remaining = config_packet_length
     
     # List of high bits
     bits = []
@@ -272,13 +302,16 @@ def parse_config_packet(bitfile, frames:list):
 
         # Skip 2 frames worth of bits whenever the row changes
         if prev_frame[1][17:23] != frame[1][17:23]:
+            frames_remaining -= FRAME_LENGTH*2
             for i in range(FRAME_LENGTH*2):
                 parse_word(bitfile)
 
         # Iterate for the number of words specified for this architecture's frame
         for word_offset in range(FRAME_LENGTH):
 
+            frames_remaining -= 1
             word = parse_word(bitfile)
+            
             # Iterate through each bit in the word
             for bit_offset, bit in enumerate(word):
                 # The first 13 bits of the 51st word per frame are reserved for the "horizontal clock row" in series-7
@@ -291,7 +324,12 @@ def parse_config_packet(bitfile, frames:list):
                     
         prev_frame = frame.copy()
 
-    return bits    
+    # now, only two dummy frames should remain to be read from the config packet
+    if frames_remaining != 2*FRAME_LENGTH:
+        print("ERROR: Config packet not fully parsed.")
+        exit()
+
+    return bits
 
 ##################################################
 #                 Main Function                  #
@@ -307,8 +345,8 @@ def get_high_bits(bitstream:str):
     # Begin reading the bitstream
     with open(bitstream, "rb") as bitfile:
         
-        # Read through header and beginning parts of bitfile, get part name along the way
-        part = find_config_packet(bitfile)
+        # Read through header and beginning parts of bitfile, get part name and config packet length along the way
+        part, config_packet_length = find_config_packet(bitfile)
 
         # Get a list of all the frames for the part. Each frame is a list with the hexadecimal
         # and binary forms of the frame address for convenience.
@@ -319,7 +357,7 @@ def get_high_bits(bitstream:str):
             exit()
 
         # Parses the configuration packet and determines the addresses of high bits in the bitstream
-        bits = parse_config_packet(bitfile, frames)
+        bits = parse_config_packet(bitfile, config_packet_length, frames)
 
     return bits
 
